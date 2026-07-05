@@ -7,9 +7,26 @@ import torch
 import lietorch
 import cv2
 import os
-import glob 
+import glob
 import time
+import json
 import argparse
+
+# SAL real-time deadline harness: when SAL_DEADLINE_FPS is set the
+# framework injects a directory containing deadline_iterator.py via
+# SAL_RUNTIME_PATH. The import is lazy (inside image_stream) so an
+# unmodified DROID env without these vars set works exactly as before.
+_SAL_DEADLINE_FPS = os.environ.get("SAL_DEADLINE_FPS")
+_SAL_DROP_LOG_PATH = os.environ.get("SAL_DROP_LOG_PATH")
+
+
+def _load_deadline_iterator():
+    """Import DeadlineIterator from SAL_RUNTIME_PATH on demand."""
+    runtime_path = os.environ.get("SAL_RUNTIME_PATH")
+    if runtime_path and runtime_path not in sys.path:
+        sys.path.insert(0, runtime_path)
+    from deadline_iterator import DeadlineIterator  # noqa: E402
+    return DeadlineIterator
 
 from torch.multiprocessing import Process
 from droid import Droid
@@ -23,8 +40,16 @@ def show_image(image):
     cv2.imshow('image', image / 255.0)
     cv2.waitKey(1)
 
-def image_stream(imagedir, calib, stride):
-    """ image generator """
+def image_stream(imagedir, calib, stride, indices=None):
+    """ image generator
+
+    When ``indices`` is None and ``SAL_DEADLINE_FPS`` is set, the image
+    list is wrapped in a ``DeadlineIterator`` that silently skips frames
+    whose wall-clock deadline has passed. When ``indices`` is provided
+    (non-None), the list is filtered to only those positions and no
+    deadline check is applied — used by ``droid.terminate(...)`` to
+    replay only the frames the live loop actually saw.
+    """
 
     calib = np.loadtxt(calib, delimiter=" ")
     fx, fy, cx, cy = calib[:4]
@@ -36,6 +61,21 @@ def image_stream(imagedir, calib, stride):
     K[1,2] = cy
 
     image_list = sorted(os.listdir(imagedir))[::stride]
+
+    if indices is not None:
+        image_list = [image_list[i] for i in indices]
+    elif _SAL_DEADLINE_FPS:
+        DeadlineIterator = _load_deadline_iterator()
+        warmup_frames = int(os.environ.get("SAL_DEADLINE_WARMUP_FRAMES", 0) or 0)
+        queue_size = int(os.environ.get("SAL_DEADLINE_QUEUE_SIZE", 1) or 1)
+        drop_policy = os.environ.get("SAL_DEADLINE_DROP_POLICY", "drop_oldest") or "drop_oldest"
+        image_list = DeadlineIterator(
+            image_list,
+            float(_SAL_DEADLINE_FPS),
+            warmup_frames=warmup_frames,
+            queue_size=queue_size,
+            drop_policy=drop_policy,
+        )
 
     for t, imfile in enumerate(image_list):
         image = cv2.imread(os.path.join(imagedir, imfile))
@@ -131,7 +171,21 @@ if __name__ == '__main__':
         
         droid.track(t, image, intrinsics=intrinsics)
 
-    traj_est = droid.terminate(image_stream(args.imagedir, args.calib, args.stride))
-    
+    # If SAL's deadline harness was active, the live loop wrote a JSON
+    # log of which dataset indices were actually processed. Replay only
+    # those in droid.terminate so global bundle adjustment doesn't
+    # reintroduce frames the SLAM never saw live.
+    survivors = None
+    if _SAL_DEADLINE_FPS and _SAL_DROP_LOG_PATH and os.path.exists(_SAL_DROP_LOG_PATH):
+        try:
+            with open(_SAL_DROP_LOG_PATH) as _f:
+                survivors = json.load(_f).get("survivors")
+        except (OSError, json.JSONDecodeError):
+            survivors = None
+
+    traj_est = droid.terminate(
+        image_stream(args.imagedir, args.calib, args.stride, indices=survivors)
+    )
+
     if args.reconstruction_path is not None:
         save_reconstruction(droid, args.reconstruction_path)
