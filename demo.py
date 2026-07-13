@@ -176,12 +176,27 @@ if __name__ == '__main__':
     # those in droid.terminate so global bundle adjustment doesn't
     # reintroduce frames the SLAM never saw live.
     survivors = None
-    if _SAL_DEADLINE_FPS and _SAL_DROP_LOG_PATH and os.path.exists(_SAL_DROP_LOG_PATH):
-        try:
-            with open(_SAL_DROP_LOG_PATH) as _f:
-                survivors = json.load(_f).get("survivors")
-        except (OSError, json.JSONDecodeError):
-            survivors = None
+    if _SAL_DEADLINE_FPS:
+        # The live pass wrote a drop log of the frames actually tracked; the BA
+        # replay must reprocess exactly those frames. If the log is missing or
+        # malformed we cannot know the tracked set. Falling through with
+        # survivors=None would be silent corruption: image_stream(indices=None)
+        # re-wraps in a SECOND DeadlineIterator (the `elif _SAL_DEADLINE_FPS`
+        # branch) that paces and drops a DIFFERENT set than was tracked, so
+        # global BA would run over the wrong frames. Fail loud instead.
+        if not (_SAL_DROP_LOG_PATH and os.path.exists(_SAL_DROP_LOG_PATH)):
+            raise RuntimeError(
+                "SAL deadline was active but no drop log at "
+                f"{_SAL_DROP_LOG_PATH!r}; cannot reconstruct the tracked frame "
+                "set for global BA. Refusing to re-drop a different set."
+            )
+        with open(_SAL_DROP_LOG_PATH) as _f:
+            survivors = json.load(_f).get("survivors")
+        if not survivors:
+            raise RuntimeError(
+                f"SAL drop log {_SAL_DROP_LOG_PATH!r} has no survivors list; "
+                "cannot reconstruct the tracked frame set."
+            )
 
     traj_est = droid.terminate(
         image_stream(args.imagedir, args.calib, args.stride, indices=survivors)
